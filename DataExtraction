@@ -20,7 +20,7 @@ OCR_OUTPUT_FOLDER = 'text_output'
 
 # --- CONFIGURACIÓN DE LA API DE GEMINI ---
 # ¡IMPORTANTE! Reemplaza "TU_CLAVE_DE_API" con tu clave real.
-GEMINI_API_KEY = "AIzaSyAYw-M-iHEzKEX6P-r16wuIUtcyvID40Lk"
+GEMINI_API_KEY = "TU_CLAVE_DE_API"
 genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = 'gemini-1.5-flash' # Usa 'gemini-1.5-pro' para mayor precisión y coste.
 
