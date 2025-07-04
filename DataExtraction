@@ -1,0 +1,293 @@
+import os
+import pytesseract
+from pdf2image import convert_from_path
+import openpyxl
+import re
+import locale
+import json
+
+# --- NUEVAS IMPORTACIONES PARA LA API DE GEMINI ---
+import google.generativeai as genai
+import time # Para manejar posibles errores de rate limit
+
+# --- CONFIGURACIÓN ---
+# Define la carpeta de entrada y el archivo de salida
+PDF_FOLDER = 'PDFs'
+EXCEL_OUTPUT_FILE = 'datos_extraidos_gemini.xlsx' # Cambié el nombre para diferenciarlo
+
+# Define la carpeta para los archivos de texto extraídos.
+OCR_OUTPUT_FOLDER = 'text_output'
+
+# --- CONFIGURACIÓN DE LA API DE GEMINI ---
+# ¡IMPORTANTE! Reemplaza "TU_CLAVE_DE_API" con tu clave real.
+GEMINI_API_KEY = "AIzaSyAYw-M-iHEzKEX6P-r16wuIUtcyvID40Lk"
+genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = 'gemini-1.5-flash' # Usa 'gemini-1.5-pro' para mayor precisión y coste.
+
+# --- OPCIONAL: Configura las rutas de Tesseract y Poppler ---
+# Si NO agregaste Tesseract y Poppler a las variables de entorno,
+# descomenta y ajusta las siguientes líneas con las rutas de los ejecutables.
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+poppler_path = r'C:\Program Files\poppler-24.08.0\Library\bin'
+
+# --- FUNCIÓN 1: Extraer texto de un PDF escaneado (OCR) ---
+def extract_text_from_scanned_pdf(pdf_path, poppler_path=None):
+    """
+    Convierte cada página del PDF en una imagen y aplica OCR para extraer el texto.
+    """
+    print(f"\n--- Paso 1: Extrayendo texto con OCR de '{os.path.basename(pdf_path)}' ---")
+    try:
+        pages = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_path)
+        
+        full_text = ""
+        for page_num, page_image in enumerate(pages):
+            print(f"   > Procesando página {page_num + 1}...")
+            text = pytesseract.image_to_string(page_image, lang='spa') # 'spa' para español
+            full_text += text + "\n\n"
+        
+        print("   > Extracción de texto completada.")
+        return full_text
+        
+    except Exception as e:
+        print(f"   > ¡ERROR! No se pudo extraer texto del PDF. Motivo: {e}")
+        return None
+
+# --- FUNCIÓN 2: Guardar el texto extraído en un archivo de texto ---
+def save_text_to_file(text_content, pdf_filename, output_folder):
+    """
+    Guarda el contenido de texto extraído en un archivo .txt con un nombre
+    basado en el PDF original.
+    """
+    txt_filename = os.path.splitext(pdf_filename)[0] + '.txt'
+    output_path = os.path.join(output_folder, txt_filename)
+    
+    print(f"\n--- Guardando el texto extraído en '{output_path}' ---")
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(text_content)
+        print(f"   > Archivo de texto guardado con éxito. ¡Revisa el contenido de '{txt_filename}'!")
+    except Exception as e:
+        print(f"   > ¡ERROR! No se pudo guardar el archivo de texto. Motivo: {e}")
+
+# --- FUNCIÓN 3 (NUEVA): Extraer información usando la API de Gemini ---
+def analyze_text_with_gemini(text_content, model):
+    """
+    Analiza el texto plano del formulario utilizando la API de Gemini para extraer
+    la información de manera estructurada en formato JSON.
+    """
+    print("\n--- Paso 2: Analizando el texto con la API de Gemini ---")
+    
+    # Define el prompt con las instrucciones y el formato de salida JSON
+    prompt = f"""
+    You are an expert at extracting structured data from documents. Extract the following information from the provided form text and return it as a JSON object.
+
+    ---
+    INSTRUCTIONS:
+    1.  Extract the value for each key specified in the JSON schema below.
+    2.  If a key is not found in the text, set its value to "N/A".
+    3.  For dates, use the format "DD/MM/YYYY".
+    4.  For numeric fields like "Monto_Total", extract only the number and convert it to a float. Handle commas (,) as decimal separators if needed.
+    5.  For the full name, separate it into "Apellido" and "Nombre".
+    6.  The output MUST be a valid JSON object. Do not include any other text or formatting outside the JSON.
+    7.  Be robust to OCR errors, extra spaces, or slight variations in labels (e.g., "N?" instead of "N°", or "PAIS" instead of "PAÍS").
+
+    ---
+    JSON SCHEMA:
+    {{
+      "Apellido": "string",
+      "Nombre": "string",
+      "Nacionalidad": "string",
+      "Tipo_Documento": "string",
+      "Numero_Documento": "string",
+      "Calle": "string",
+      "Nro": "string",
+      "Piso": "string",
+      "Departamento": "string",
+      "Localidad": "string",
+      "Codigo_Postal": "string",
+      "Provincia": "string",
+      "Pais": "string",
+      "Fecha_de_Nacimiento": "string",
+      "Email": "string",
+      "Radicada_en_el_Exterior": "boolean",
+      "Radicada_en_Paraiso_Fiscal": "boolean",
+      "Es_Peps": "boolean",
+      "Fecha_de_Operacion": "string",
+      "Tipo_de_Moneda": "string",
+      "Monto_Total": "float",
+      "Monto_Total_en_Pesos": "float",
+      "Pago_en_favor_de_Terceros": "boolean",
+      "Forma_de_Pago": "string",
+      "Porcentaje_del_pago_total": "float",
+      "Fecha_de_pago": "string",
+      "REPORTE UIF": "string",
+      "XLSM": "string",
+      "cuil": "string",
+      "N° DE FORMULARIO PREMIO": "string",
+      "ACTIVIDAD DECLARADA": "string",
+      "EMPRESA EN LA QUE DESARROLLA SUS TAREAS": "string",
+      "ORIGEN DE FONDOS DECLARADO": "string",
+      "PEP (SI/NO)": "string",
+      "SO (SI/NO)": "string",
+      "OBSERVACIONES FORMULARIO DE PAGO DE PREMIO": "string"
+    }}
+    
+    ---
+    TEXT TO ANALYZE:
+    {text_content}
+    """
+    
+    try:
+        # Generar contenido con la configuración para obtener JSON.
+        # Esto es clave para asegurar una respuesta parseable.
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        
+        # Parsear la respuesta JSON
+        extracted_info = json.loads(response.text)
+        print("   > Extracción con Gemini completada. Validando datos...")
+        
+        # Lógica de post-procesamiento para Monto y otros campos.
+        # Esto es importante para asegurar el formato correcto de los datos.
+        if isinstance(extracted_info.get('Monto_Total'), str):
+            monto_str = extracted_info['Monto_Total']
+            clean_monto = monto_str.replace('.', '').replace(',', '.') # Limpiar el formato de miles y decimales
+            try:
+                extracted_info['Monto_Total'] = float(clean_monto)
+                extracted_info['Monto_Total_en_Pesos'] = float(clean_monto)
+            except ValueError:
+                extracted_info['Monto_Total'] = 'N/A'
+                extracted_info['Monto_Total_en_Pesos'] = 'N/A'
+                print(f"   > ¡ADVERTENCIA! No se pudo convertir el monto '{monto_str}' a número.")
+
+        # Imprimir un resumen de los datos extraídos para verificación
+        print("\n--- Paso 3: Resumen de datos extraídos por Gemini ---")
+        for key, value in extracted_info.items():
+            if value not in ['N/A', '', False, 'NO']:
+                print(f"   > {key}: {value}")
+                
+        return extracted_info
+
+    except genai.APIError as e:
+        print(f"   > ¡ERROR en la API de Gemini! Revisa tu clave y conexión. Motivo: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"   > ¡ERROR al decodificar JSON! La respuesta de la API no fue un JSON válido. Motivo: {e}")
+        print(f"   > Respuesta recibida: {response.text}")
+        return None
+    except Exception as e:
+        print(f"   > ¡ERROR inesperado durante la extracción con Gemini! Motivo: {e}")
+        return None
+
+# --- FUNCIÓN 4: Guardar los datos extraídos en un archivo Excel ---
+# Esta función permanece sin cambios.
+def save_to_excel(data_list, output_file):
+    """
+    Guarda una lista de diccionarios de datos en un archivo Excel (`.xlsx`),
+    usando la estructura de columnas que especificaste.
+    """
+    print(f"\n--- Paso 5: Guardando los datos en el archivo Excel '{output_file}' ---")
+    
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Datos Extraccion"
+    
+    headers = [
+        'Apellido', 'Nombre', 'Nacionalidad', 'Tipo_Documento', 'Numero_Documento',
+        'Calle', 'Nro', 'Piso', 'Departamento', 'Localidad', 'Codigo_Postal',
+        'Provincia', 'Pais', 'Fecha_de_Nacimiento', 'Email',
+        'Radicada_en_el_Exterior', 'Radicada_en_Paraiso_Fiscal', 'Es_Peps',
+        'Fecha_de_Operacion', 'Tipo_de_Moneda', 'Monto_Total', 'Monto_Total_en_Pesos',
+        'Pago_en_favor_de_Terceros', 'Forma_de_Pago', 'Porcentaje_del_pago_total',
+        'Fecha_de_pago', 'REPORTE UIF', 'XLSM', 'cuil', 'N° DE FORMULARIO PREMIO',
+        'ACTIVIDAD DECLARADA', 'EMPRESA EN LA QUE DESARROLLA SUS TAREAS',
+        'ORIGEN DE FONDOS DECLARADO', 'PEP (SI/NO)', 'SO (SI/NO)',
+        'OBSERVACIONES FORMULARIO DE PAGO DE PREMIO'
+    ]
+    
+    sheet.append(headers)
+    print("   > Encabezados de las columnas añadidos al Excel.")
+    
+    for row_data in data_list:
+        row_to_write = [row_data.get(header, 'N/A') for header in headers]
+        sheet.append(row_to_write)
+        print(f"   > Fila añadida para el PDF: {row_data.get('archivo', 'N/A')}")
+        
+    workbook.save(output_file)
+    print("\n--- ¡Proceso completado con éxito! ---")
+    print(f"Los datos se han guardado en el archivo '{output_file}'.")
+
+# --- FUNCIÓN PRINCIPAL: Orquesta todo el proceso ---
+def main():
+    """
+    Función principal que coordina la carga de PDFs, la extracción, el análisis y el guardado.
+    """
+    print("--- INICIANDO EL SCRIPT DE EXTRACCIÓN DE DATOS DE PDFS ---")
+    
+    # 1. Verifica la clave de API
+    if GEMINI_API_KEY == "TU_CLAVE_DE_API" or not GEMINI_API_KEY:
+        print("¡ERROR! Por favor, configura tu clave de API de Gemini en la variable 'GEMINI_API_KEY' en la línea 24 del script.")
+        print("Puedes obtener una clave gratuita en: https://aistudio.google.com/app/apikey")
+        return
+        
+    # 2. Inicializa el modelo de Gemini
+    print(f"Inicializando el modelo de Gemini: {GEMINI_MODEL}...")
+    try:
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        print("Modelo de Gemini inicializado con éxito.")
+    except Exception as e:
+        print(f"¡ERROR al inicializar el modelo de Gemini! Revisa tu clave de API. Motivo: {e}")
+        return
+
+    # 3. Verifica si la carpeta de PDFs existe
+    if not os.path.isdir(PDF_FOLDER):
+        print(f"¡ERROR! La carpeta '{PDF_FOLDER}' no existe.")
+        print("Por favor, crea la carpeta y coloca tus PDFs escaneados dentro.")
+        return
+    
+    # 4. Crea la carpeta de salida para los archivos de texto si no existe
+    if not os.path.exists(OCR_OUTPUT_FOLDER):
+        os.makedirs(OCR_OUTPUT_FOLDER)
+        print(f"   > Se creó la carpeta '{OCR_OUTPUT_FOLDER}' para guardar los archivos de texto.")
+        
+    all_extracted_data = [] # Lista para almacenar los datos de todos los PDFs
+    
+    # 5. Itera sobre cada archivo en la carpeta
+    for filename in os.listdir(PDF_FOLDER):
+        if filename.lower().endswith('.pdf'):
+            pdf_path = os.path.join(PDF_FOLDER, filename)
+            
+            # --- Procesa cada PDF uno a la vez ---
+            
+            # 5.1. Extraer el texto del PDF usando OCR
+            text_content = extract_text_from_scanned_pdf(pdf_path, poppler_path=locals().get('poppler_path'))
+            
+            if text_content:
+                # 5.2. Guardar el texto extraído en un archivo .txt
+                save_text_to_file(text_content, filename, OCR_OUTPUT_FOLDER)
+                
+                # 5.3. Analizar el texto con la API de Gemini para extraer los datos
+                extracted_info = analyze_text_with_gemini(text_content, model)
+                
+                if extracted_info:
+                    # 5.4. Añade el nombre del archivo al diccionario de datos
+                    extracted_info['archivo'] = filename
+                    
+                    # 5.5. Agrega los datos extraídos de este PDF a la lista general
+                    all_extracted_data.append(extracted_info)
+
+                # Pausa de 1 segundo para evitar límites de tasa en el nivel gratuito.
+                time.sleep(1) 
+
+            
+    # 6. Guardar todos los datos extraídos en un solo archivo Excel
+    if all_extracted_data:
+        save_to_excel(all_extracted_data, EXCEL_OUTPUT_FILE)
+    else:
+        print("\nNo se encontraron PDFs para procesar o la extracción de texto falló para todos.")
+
+# Punto de entrada del script
+if __name__ == "__main__":
+    main()
